@@ -723,7 +723,7 @@ def format_comment(verdicts: list[Verdict]) -> str:
     total = len(verdicts)
 
     lines: list[str] = []
-    lines.append("## GitHub Actions Supply Chain Audit\n")
+    lines.append("## Supply Chain Audit - GitHub Actions\n")
 
     if high_count > 0:
         lines.append(
