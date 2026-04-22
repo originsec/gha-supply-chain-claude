@@ -70,7 +70,9 @@ runs:
         exit $exit_code
 
     - name: Comment on PR
-      if: steps.audit.outputs.body != ''
+      # Post the comment even when the audit step exited non-zero (critical
+      # verdicts and API failures should surface the findings, not drop them).
+      if: (success() || failure()) && steps.audit.outputs.body != ''
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}

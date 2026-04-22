@@ -43,6 +43,10 @@ ANTHROPIC_API_VERSION = "2023-06-01"
 USER_AGENT = "gha-supply-chain-audit/1.0 (github.com/originsec/gha-supply-chain-claude)"
 FETCH_DELAY = 0.25  # courtesy delay between GitHub API fetches (seconds)
 MAX_COMMENT_CHARS = 60_000
+# Cap the diff payload sent to Claude. Well under Sonnet's 200k token limit
+# even at worst-case ~2 chars/token for minified JS; leaves headroom for the
+# system prompt, user wrapper, and response.
+MAX_DIFF_CHARS = 150_000
 SUPPRESS_MARKER = "[supply-chain-audit-ok]"
 
 # Workflow YAMLs live under .github/workflows; composite actions live in
@@ -555,6 +559,20 @@ def diff_trees(old_dir: Path | None, new_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _truncate_diff(diff_text: str) -> tuple[str, bool]:
+    """Cap diff_text at MAX_DIFF_CHARS; return (maybe-truncated-text, was_truncated)."""
+    if len(diff_text) <= MAX_DIFF_CHARS:
+        return diff_text, False
+    truncated = diff_text[:MAX_DIFF_CHARS]
+    omitted = len(diff_text) - MAX_DIFF_CHARS
+    truncated += (
+        f"\n\n... (diff truncated: {omitted} characters omitted to fit within "
+        f"Claude's context window; audit only reflects the leading "
+        f"{MAX_DIFF_CHARS} characters)\n"
+    )
+    return truncated, True
+
+
 def call_claude(
     display: str,
     old_ref: str | None,
@@ -565,6 +583,14 @@ def call_claude(
     model: str,
 ) -> dict:
     """Call Claude to audit an action diff. Returns the parsed verdict dict."""
+    diff_text, was_truncated = _truncate_diff(diff_text)
+    truncation_note = (
+        "\n\nNote: the diff exceeded the size limit and was truncated. "
+        "Reflect this uncertainty in your verdict — do not claim confidence "
+        "about un-inspected regions.\n"
+        if was_truncated
+        else ""
+    )
     if old_ref is None:
         user_msg = (
             f'Analyze the following contents for the newly added GitHub Actions '
@@ -572,7 +598,7 @@ def call_claude(
             f"This is a new action dependency. All file contents are shown as "
             f"additions. Pay special attention to whether the action's stated "
             f"purpose matches its code and whether it contains any suspicious "
-            f"functionality.\n\n"
+            f"functionality.{truncation_note}\n\n"
             f"<diff>\n{diff_text}\n</diff>"
         )
     else:
@@ -580,7 +606,7 @@ def call_claude(
             f'Analyze the following diff for the GitHub Actions reference '
             f'"{display}" ({kind}, ref changed from {old_ref} to {new_ref}).\n\n'
             f"The diff shows all file changes in the action's source repository "
-            f"between the two refs.\n\n"
+            f"between the two refs.{truncation_note}\n\n"
             f"<diff>\n{diff_text}\n</diff>"
         )
 
@@ -623,6 +649,14 @@ def call_claude(
             return parsed
         except json.JSONDecodeError as e:
             last_err = f"Invalid JSON from Claude: {e}\nRaw response: {text[:500]}"
+        except urllib.error.HTTPError as e:
+            # Capture the response body — the Anthropic API includes an error
+            # type + message that's essential for diagnosing 400s.
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = "<unreadable>"
+            last_err = f"API request failed: {e} — {body[:500]}"
         except (urllib.error.URLError, OSError) as e:
             last_err = f"API request failed: {e}"
 
