@@ -1,0 +1,88 @@
+name: "GitHub Actions Supply Chain Audit"
+description: "Audits changed GitHub Actions references for supply chain attacks using Claude"
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key for Claude"
+    required: true
+  model:
+    description: "Claude model to use for analysis"
+    required: false
+    default: "claude-sonnet-4-20250514"
+  base_ref:
+    description: "Git ref to diff against (default: auto-detected from PR base)"
+    required: false
+    default: ""
+  github_token:
+    description: "GitHub token for resolving refs and fetching action source tarballs"
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Determine base ref
+      id: base
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.base_ref }}" ]; then
+          echo "ref=${{ inputs.base_ref }}" >> "$GITHUB_OUTPUT"
+        elif [ -n "${{ github.base_ref }}" ]; then
+          echo "ref=origin/${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "ref=origin/main" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Check for workflow / action YAML changes
+      id: changed
+      shell: bash
+      run: |
+        # Matches workflow YAMLs under .github/workflows/ and any action.y(a)ml at any depth.
+        if git diff --name-only ${{ steps.base.outputs.ref }}...HEAD \
+            | grep -Eq '(^|/)\.github/workflows/.+\.ya?ml$|(^|/)action\.ya?ml$'; then
+          echo "yaml_changed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "No workflow or action YAML changes detected, skipping audit."
+        fi
+
+    - name: Run supply chain audit
+      id: audit
+      if: steps.changed.outputs.yaml_changed == 'true'
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        AUDIT_MODEL: ${{ inputs.model }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        # Script writes the PR comment to stdout and logs to stderr.
+        comment=$(python3 "${{ github.action_path }}/scripts/audit-supply-chain.py" "${{ steps.base.outputs.ref }}")
+        exit_code=$?
+        if [ -n "$comment" ]; then
+          {
+            echo 'body<<AUDIT_EOF'
+            echo "$comment"
+            echo AUDIT_EOF
+          } >> "$GITHUB_OUTPUT"
+        fi
+        exit $exit_code
+
+    - name: Comment on PR
+      if: steps.audit.outputs.body != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMMENT_BODY: ${{ steps.audit.outputs.body }}
+      run: |
+        # Check for existing audit comment and update it, or create new
+        existing=$(gh pr view ${{ github.event.number }} --json comments --jq '.comments[] | select(.body | startswith("## GitHub Actions Supply Chain Audit")) | .url' 2>/dev/null | head -1)
+        if [ -n "$existing" ]; then
+          comment_id=$(echo "$existing" | grep -oP '\d+$')
+          gh api repos/${{ github.repository }}/issues/comments/${comment_id} \
+            -X PATCH \
+            -f body="$COMMENT_BODY"
+        else
+          gh pr comment ${{ github.event.number }} --body "$COMMENT_BODY"
+        fi
