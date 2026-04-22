@@ -70,8 +70,11 @@ runs:
         AUDIT_CACHE_FILE: ~/.cache/gha-supply-chain-audit/verdicts.json
       run: |
         # Script writes the PR comment to stdout and logs to stderr.
-        comment=$(python3 "${{ github.action_path }}/scripts/audit-supply-chain.py" "${{ steps.base.outputs.ref }}")
-        exit_code=$?
+        # `|| exit_code=$?` keeps `set -e` (GHA's default) from aborting the
+        # command substitution when Claude returns a critical verdict — we
+        # need to record the comment output before propagating the exit code.
+        exit_code=0
+        comment=$(python3 "${{ github.action_path }}/scripts/audit-supply-chain.py" "${{ steps.base.outputs.ref }}") || exit_code=$?
         if [ -n "$comment" ]; then
           # Random heredoc delimiter prevents attacker-controlled action source
           # (via Claude's verdict summary) from closing the heredoc early and
