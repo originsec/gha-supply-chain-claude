@@ -573,6 +573,38 @@ def _truncate_diff(diff_text: str) -> tuple[str, bool]:
     return truncated, True
 
 
+def parse_verdict_text(text: str) -> dict:
+    """Extract the JSON verdict from Claude's response text.
+
+    Tolerates three forms of decoration around the JSON object:
+      - markdown fences (```json ... ```),
+      - leading prose before the `{`,
+      - trailing commentary after the `}`.
+    Raises json.JSONDecodeError if no valid JSON object can be located.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```\w*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+        text = text.strip()
+
+    decoder = json.JSONDecoder()
+    # Try each `{` as a potential start. raw_decode ignores trailing junk, so
+    # we just need to find a start offset that yields a valid object.
+    last_err: json.JSONDecodeError | None = None
+    for start in range(len(text)):
+        if text[start] != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text, start)
+            return parsed
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+
+    raise last_err or json.JSONDecodeError("No JSON object found", text, 0)
+
+
 def call_claude(
     display: str,
     old_ref: str | None,
@@ -639,14 +671,7 @@ def call_claude(
             for block in result.get("content", []):
                 if block.get("type") == "text":
                     text += block["text"]
-            text = text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```\w*\n?", "", text)
-                text = re.sub(r"\n?```$", "", text)
-                text = text.strip()
-            # raw_decode tolerates trailing commentary after the JSON object
-            parsed, _ = json.JSONDecoder().raw_decode(text)
-            return parsed
+            return parse_verdict_text(text)
         except json.JSONDecodeError as e:
             last_err = f"Invalid JSON from Claude: {e}\nRaw response: {text[:500]}"
         except urllib.error.HTTPError as e:
