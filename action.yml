@@ -48,6 +48,17 @@ runs:
           echo "No workflow or action YAML changes detected, skipping audit."
         fi
 
+    - name: Restore verdict cache
+      if: steps.changed.outputs.yaml_changed == 'true'
+      uses: actions/cache@v4
+      with:
+        # Cache entries are keyed by resolved commit SHAs — immutable by
+        # git content-addressing — so reuse across PRs is safe.
+        path: ~/.cache/gha-supply-chain-audit
+        key: ${{ runner.os }}-gha-audit-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          ${{ runner.os }}-gha-audit-
+
     - name: Run supply chain audit
       id: audit
       if: steps.changed.outputs.yaml_changed == 'true'
@@ -56,15 +67,20 @@ runs:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
         AUDIT_MODEL: ${{ inputs.model }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
+        AUDIT_CACHE_FILE: ~/.cache/gha-supply-chain-audit/verdicts.json
       run: |
         # Script writes the PR comment to stdout and logs to stderr.
         comment=$(python3 "${{ github.action_path }}/scripts/audit-supply-chain.py" "${{ steps.base.outputs.ref }}")
         exit_code=$?
         if [ -n "$comment" ]; then
+          # Random heredoc delimiter prevents attacker-controlled action source
+          # (via Claude's verdict summary) from closing the heredoc early and
+          # injecting keys into $GITHUB_OUTPUT.
+          delim="AUDIT_EOF_$(openssl rand -hex 16)"
           {
-            echo 'body<<AUDIT_EOF'
-            echo "$comment"
-            echo AUDIT_EOF
+            printf 'body<<%s\n' "$delim"
+            printf '%s\n' "$comment"
+            printf '%s\n' "$delim"
           } >> "$GITHUB_OUTPUT"
         fi
         exit $exit_code

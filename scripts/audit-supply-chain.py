@@ -852,6 +852,48 @@ def _display_for(change: RefChange) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Verdict cache
+# ---------------------------------------------------------------------------
+#
+# An action's source at a full commit SHA is immutable (git content-addressing
+# prevents a SHA from pointing at two different trees). Keying the cache by
+# (owner/repo/subpath, old_sha, new_sha) yields entries that are safe to
+# reuse across repos and PRs — the identity is looked up *after* we resolve
+# any @tag or @branch to a full SHA via the GitHub API.
+
+CACHE_VERSION = 1
+
+
+def cache_key(display_no_ref: str, old_sha: str | None, new_sha: str | None) -> str:
+    return f"{display_no_ref}|{old_sha or ''}|{new_sha or ''}"
+
+
+def load_verdict_cache(path: str | None) -> dict[str, dict]:
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return {}
+    entries = data.get("entries", {})
+    return entries if isinstance(entries, dict) else {}
+
+
+def save_verdict_cache(path: str | None, cache: dict[str, dict]) -> None:
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"version": CACHE_VERSION, "entries": cache}, f)
+    except OSError as e:
+        print(f"::warning::Failed to save verdict cache: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -949,6 +991,10 @@ def main() -> int:
         file=sys.stderr,
     )
 
+    cache_path = os.environ.get("AUDIT_CACHE_FILE")
+    cache = load_verdict_cache(cache_path)
+    cache_hits = 0
+
     # Source-diff audit for each actual change
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -981,6 +1027,27 @@ def main() -> int:
                 if change.old_ref
                 else None
             )
+
+            # Cache lookup keyed by resolved SHAs — immutable by git content-addressing.
+            display_no_ref = f"{change.owner}/{change.repo}"
+            if change.subpath:
+                display_no_ref += f"/{change.subpath}"
+            key = cache_key(display_no_ref, old_sha, new_sha)
+            if key in cache:
+                entry = cache[key]
+                verdicts.append(
+                    Verdict(
+                        display=display,
+                        change=change,
+                        risk=entry.get("risk", "medium"),
+                        summary=entry.get("summary", ""),
+                        findings=entry.get("findings", []),
+                        kind="audit",
+                    )
+                )
+                cache_hits += 1
+                print(f"  cache hit ({key})", file=sys.stderr)
+                continue
 
             new_tar = download_tarball(change.owner, change.repo, new_sha, tmp_path, gh_token)
             if FETCH_DELAY:
@@ -1030,15 +1097,14 @@ def main() -> int:
 
             diff_text = diff_trees(old_dir, new_dir)
             if not diff_text.strip():
+                entry = {
+                    "risk": "none",
+                    "summary": "No source changes detected between refs.",
+                    "findings": [],
+                }
+                cache[key] = entry
                 verdicts.append(
-                    Verdict(
-                        display=display,
-                        change=change,
-                        risk="none",
-                        summary="No source changes detected between refs.",
-                        findings=[],
-                        kind="audit",
-                    )
+                    Verdict(display=display, change=change, kind="audit", **entry)
                 )
                 continue
 
@@ -1051,16 +1117,25 @@ def main() -> int:
                 api_key=api_key,
                 model=model,
             )
+            entry = {
+                "risk": verdict_data.get("risk", "medium"),
+                "summary": verdict_data.get("summary", "No summary provided."),
+                "findings": verdict_data.get("findings", []),
+            }
+            # Only cache real Claude verdicts; transient errors should retry.
+            if "Audit failed" not in entry["summary"]:
+                cache[key] = entry
             verdicts.append(
-                Verdict(
-                    display=display,
-                    change=change,
-                    risk=verdict_data.get("risk", "medium"),
-                    summary=verdict_data.get("summary", "No summary provided."),
-                    findings=verdict_data.get("findings", []),
-                    kind="audit",
-                )
+                Verdict(display=display, change=change, kind="audit", **entry)
             )
+
+    save_verdict_cache(cache_path, cache)
+    if cache_path:
+        print(
+            f"Verdict cache: {cache_hits}/{len(changes)} hits; "
+            f"{len(cache)} total entries stored.",
+            file=sys.stderr,
+        )
 
     if not verdicts:
         print("No actionable findings.", file=sys.stderr)
