@@ -510,7 +510,7 @@ class TestFormatComment:
     def test_contains_header_and_transitivity_banner(self):
         v = self._audit_verdict("actions/checkout@v4", "none")
         out = format_comment([v])
-        assert "## GitHub Actions Supply Chain Audit" in out
+        assert "## Supply Chain Audit - GitHub Actions" in out
         assert "Transitive actions" in out
 
     def test_sorts_by_risk(self):
